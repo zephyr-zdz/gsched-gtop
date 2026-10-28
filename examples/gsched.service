@@ -1,0 +1,18 @@
+# systemd user unit for the gsched controller.
+#   cp examples/gsched.service ~/.config/systemd/user/ && systemctl --user enable --now gsched
+# (`loginctl enable-linger $USER` keeps it running while you are logged out.)
+[Unit]
+Description=gsched GPU job queue controller
+After=network-online.target
+
+[Service]
+# where `pip install` / `uv tool install` put the gsched script
+ExecStart=%h/.local/bin/gsched daemon
+Restart=always
+# only the daemon: jobs it started on this host (setsid) must survive a restart; the new daemon re-adopts them by pid
+KillMode=process
+RestartSec=30
+Nice=5
+
+[Install]
+WantedBy=default.target

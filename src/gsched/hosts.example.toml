@@ -1,0 +1,62 @@
+# gsched hosts. One [hosts.<name>] block per machine; adding a server = adding a block.
+# The daemon rereads this file on every pass, so edits take effect without a restart.
+#
+# Lower tier = preferred. A job moves up to the next tier only after it waited fallback_after_min with nothing free
+# below (or right away when it names hosts with --hosts). Within a tier, the host whose share of gsched-used cards
+# (relative to its max_gpus) is lowest wins.
+
+[defaults]
+idle_mem_mib = 2000        # a GPU counts as idle below this used memory (after ignored foreign processes)...
+idle_util = 10             # ...and below this utilization (%)...
+idle_seconds = 90          # ...continuously for this long (debounce against epoch gaps / restarts)
+foreign_ignore_mib = 1024  # other users' processes smaller than this don't block (stale CUDA contexts)
+pack_headroom_gb = 4       # free GPU memory kept on shared GPUs when packing --gpu-mem jobs
+max_jobs_per_gpu = 4       # at most this many packed (--gpu-mem) jobs on one GPU
+host_mem_reserve_gb = 16   # RAM left free on a node after a job's --mem
+poll_seconds = 60          # one scheduling pass per this many seconds
+fallback_after_min = 10    # minutes a job waits before it may use the next tier
+bwlimit = "0"              # rsync --bwlimit for syncs and fetches ("0" = unlimited; e.g. "50m"); per host too
+# reservations_cmd = "my-gpu-board --json"   # optional: prints {"<host>": {"<gpu index>": ["holder", ...]}};
+#                                             # cards reserved by anyone but you are never used
+
+# The machine the controller runs on.
+[hosts.box1]
+backend = "node"
+ssh = "local"              # no ssh: run commands here
+tier = 1
+max_gpus = 2               # at most this many cards used by gsched at once (leave some for colleagues)
+gpu_types = ["RTX_4090"]   # what --gpu-type matches (free-form names, your choice)
+
+# Another server reachable with passwordless ssh. It needs nvidia-smi and python3; nothing is installed there.
+[hosts.box2]
+backend = "node"
+ssh = "me@box2.example.org"   # anything `ssh` accepts, incl. aliases from ~/.ssh/config
+# ssh_opts = ["-J", "jumphost"]
+tier = 1
+max_gpus = 4
+gpu_types = ["A6000"]
+# home = "/home/me"        # if your home differs there: paths under ~ are remapped to it
+# setup = "source ~/miniconda3/etc/profile.d/conda.sh"   # run before every job on this host
+# quiet_hours = "01:00-08:00"   # controller's local time: no new jobs; running ones are paused (SIGSTOP/SIGCONT)
+# enabled = false          # keep it in `status` / gtop but never place jobs here
+
+# A Slurm cluster as overflow: gsched sbatches into it when tier 1 is full.
+# [hosts.cluster]
+# backend = "slurm"
+# ssh = "me@login.cluster.example.org"
+# tier = 2
+# max_gpus = 4             # our jobs' cards on the cluster at most
+# partition = "gpu"
+# gpu_types = ["A100", "V100"]          # allowed GRES types, in order of preference
+# gres_types = { H100 = "h100_sxm" }    # gsched card type -> Slurm GRES type, where they differ
+# gpu_labels = { "gn03:A100" = "A100-80G" }   # status/gtop labels for GRES types that hide variants
+# cpu_models = { gn03 = "2x EPYC 9354" }    # shown by status/gtop
+# default_time = "1-00:00:00"
+# queue_ahead = 1          # jobs submitted with --queue-ahead may wait PENDING in Slurm, at most 1 at a time
+# home = "/home/me"
+# setup = "source ~/miniconda3/etc/profile.d/conda.sh"
+
+# Optional per-client caps: submit --client NAME (default: your OS user). A client's cards on a host stay within
+# both the host's max_gpus and its own cap here. Handy when an automated agent submits through gsched too.
+# [clients.my-agent]
+# max_gpus = { box1 = 1, cluster = 2 }

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsched"
+dynamic = ["version"]
+description = "A small GPU job queue over ssh (+ Slurm overflow) and gtop, an nvtop-style monitor for the same hosts"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "zephyr-zdz" }]
+dependencies = []
+keywords = ["gpu", "scheduler", "slurm", "nvidia-smi", "ssh", "monitor"]
+classifiers = [
+    "Environment :: Console :: Curses",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Homepage = "https://github.com/zephyr-zdz/gsched-gtop"
+
+[project.scripts]
+gsched = "gsched.core:main"
+gtop = "gsched.gtop:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "gsched.__version__" }
+
+[tool.setuptools.package-data]
+gsched = ["hosts.example.toml"]
