@@ -14,8 +14,11 @@ with patch.dict(os.environ, {
     "GSCHED_CONFIG": str(_root / "hosts.toml"),
     "GSCHED_STATE": str(_root / "state"),
     "GSCHED_WORK": str(_root / "work"),
+    "CSCHED_CONFIG": str(_root / "csched.toml"),
+    "CSCHED_STATE": str(_root / "csched-state"),
+    "CSCHED_WORK": str(_root / "csched-work"),
 }):
-    from gsched import core, gtop
+    from gsched import core, gtop, csched
 
 
 def host(name="node", **overrides):

@@ -9,15 +9,24 @@ Slurm hosts: one ssh per gtop session runs a small monitor on the login node; fo
 starts one `srun --overlap` step that streams the same per-GPU probe from inside the job (one step per job and gtop
 session, not one per refresh: steps count toward MaxStepCount and show in sacct). Refresh there: max(5 s, interval).
 
+Second page: csched, the separate CPU job queue (Tab toggles pages; C = CPU page, V = GPU page; --cpu or the `ctop`
+entry point starts there). Per enabled csched host (preferred first): our cores / max_cpus, QUIET during quiet hours;
+node hosts a load bar + available RAM, Slurm hosts one line per node (CPU allocation bar, unallocated RAM, state).
+Below: the csched job table like `csched ls` (active + last-24 h jobs). csched's gather() ssh-probes every host, so
+it runs in a background thread every ~20 s and only while the CPU page is on screen.
+
   gtop                 interactive (q quit, j/k/PgUp/PgDn/g/G scroll, +/- interval, a all procs,
-                       c full command lines, l log of a job, h help)
+                       c full command lines, l log of a job, h help, Tab CPU page)
+  ctop                 same binary through an entry point / symlink: starts on the CPU page
   gtop --once          print one snapshot as plain text and exit
   gtop --json          dump the raw per-host probe as JSON and exit
 """
 import argparse, curses, json, locale, os, re, shlex, sqlite3, subprocess, sys, threading, time
 from collections import deque
+from pathlib import Path
 
 from . import core as G  # gsched's config, ssh and node_view, so card labels match the scheduler
+from . import csched as C  # csched's config, ssh probes and job tables, for the CPU page
 
 SMI_FIELDS = "index,uuid,memory.used,memory.total,utilization.gpu,name,temperature.gpu,power.draw,power.limit,fan.speed,clocks.sm"
 
@@ -307,6 +316,80 @@ class Poller:
             t.start()
         for t in ts:
             t.join()
+
+
+class CpuPoller:
+    """csched poller: gather() ssh-probes every enabled host (a few seconds), so it runs in its own thread every ~20 s
+    and only while the CPU page is on screen; the UI just reads the last result under the lock."""
+
+    def __init__(self, interval=20.0):
+        self.interval = interval
+        self.config_err = None
+        try:
+            self.hosts = {n: h for n, h in C.load_config()[1].items() if h["enabled"]}
+        except (Exception, SystemExit) as e:  # no csched config yet: the GPU page still works
+            self.hosts, self.config_err = {}, f"csched: {e}"
+        self.state, self.jobs, self.t, self.err = {}, [], 0, None
+        self.topo = {}  # C.topology(hosts), cached in a JSON file, so cheap after the first call
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.want = False  # set by the UI each frame
+
+    def poll(self):
+        if self.config_err:
+            with self.lock:
+                self.err, self.t = self.config_err, time.time()
+            self.wake.set()
+            return
+        try:
+            c = cpu_db()
+            views, jobs = {}, []
+            if c is not None:
+                try:
+                    views = C.gather(c, self.hosts)
+                    for j in C.job_rows(c, False):
+                        jobs.append({**dict(j), "counts": C.counts(c, j["id"]),
+                                     "cpus": json.loads(j["spec"]).get("cpus", 1),
+                                     "hosts": [r[0] for r in c.execute(
+                                         f"select distinct host from shards where job=? and state in {C.ACTIVE_SHARD}",
+                                         (j["id"],))]})
+                finally:
+                    c.close()
+            try:
+                topo = C.topology(self.hosts)  # ssh-probes only when stale/missing; failure just drops the topology
+            except Exception:  # noqa: BLE001
+                topo = {}
+            with self.lock:
+                self.state, self.jobs, self.err, self.t, self.topo = views, jobs, None, time.time(), topo
+        except Exception as e:  # noqa: BLE001
+            with self.lock:
+                self.err, self.t = str(e) or type(e).__name__, time.time()
+        self.wake.set()
+
+    def loop(self):
+        while True:
+            if not self.want:
+                self.wake.wait(1.0)  # CPU page not shown: idle, no ssh
+                continue
+            t0 = time.time()
+            self.poll()
+            time.sleep(max(2.0, self.interval - (time.time() - t0)))
+
+    def start(self):
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def once(self):
+        self.poll()
+
+
+def cpu_db():
+    """csched's DB read-only; csched.db() creates it on first use, and so does this (no jobs in it yet)."""
+    path = C.STATE / "csched.db"
+    if path.exists():
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        c.row_factory = sqlite3.Row
+        return c
+    return C.db()
 
 
 def smi_rows(text):
@@ -665,6 +748,86 @@ def build(poller, cfg, W, opts):
     return L
 
 
+CSTATE = {"queued": "yellow", "running": "green", "staging": "cyan", "done": "dim", "failed": "red",
+          "cancelled": "dim"}
+
+
+def build_cpu(poller, W):
+    """CPU page: per enabled csched host (pref order) a header, its Slurm nodes, then the csched job table."""
+    with poller.lock:
+        views, jobs, t, err, topo = dict(poller.state), poller.jobs, poller.t, poller.err, poller.topo
+    L = []
+    for n, h in sorted(poller.hosts.items(), key=lambda x: x[1]["pref"]):
+        v = views.get(n)
+        head = [("━ ", "dim"), (f"{n:<9}", "bold"), (f" {h['backend']}", "dim")]
+        if v is None:
+            head += [("  probing…", "dim")]
+        elif not v.get("ok"):
+            head += [(f"  UNREACHABLE: {v.get('err', '?')}", "red"),
+                     (f"  (data from {ago(t)} ago)" if t else "", "dim")]
+        else:
+            head += [(f"  ours {v.get('ours_cpus', 0):>2}/{h['max_cpus']} cpus", "")]
+            if h["backend"] == "slurm" and v.get("ours_pending"):
+                head += [(f" ({v['ours_pending']} pending)", "dim")]
+            head += [(f"  [{C.topo_str(topo.get(n))}]", "dim")]
+        if C.quiet_now(h):
+            head += [("  QUIET", "yellow")]
+        L.append(head)
+        if v is None or not v.get("ok"):
+            continue
+        if h["backend"] == "node":
+            frac = v["load"] / v["ncpu"] if v["ncpu"] else 0
+            free = C.slots({"cpus": 1, "mem_gb": 0}, h, v, {})[0]
+            L.append([(f"  load {bar(frac, 8)} {v['load']:5.1f}/{v['ncpu']:.0f}", util_color(frac * 100)),
+                      (f"  RAM avail {v['mem_avail_gb']:5.0f}G", ""),
+                      (f"  free now {free} cpus", "")])
+        else:
+            tnodes = (topo.get(n) or {}).get("nodes", {})
+            for node, r in sorted(v["nodes"].items()):
+                cf = (r["cpu_total"] - r["cpu_idle"]) / r["cpu_total"] if r["cpu_total"] else 0
+                mf = 1 - r["mem_unalloc_gb"] / r["mem_total_gb"] if r["mem_total_gb"] else 0
+                x = tnodes.get(node)
+                xt = f"{x['cores']}C{x['threads']}T" if x else ""
+                g = f"  GPU {r['gpus'] - r['gpus_used']}/{r['gpus']} free" if r.get("gpus") else ""
+                L.append([(f"  {node:<10}", "bold"), (f" {r['state']:<8}", "" if r["up"] else "red"),
+                          (f"{xt:<8}", "dim"),
+                          (f" CPU {bar(cf, 8)} {r['cpu_total'] - r['cpu_idle']:>3}/{r['cpu_total']:<3}",
+                           util_color(cf * 100)),
+                          (" RAM " + f"{r['mem_total_gb'] - r['mem_unalloc_gb']:.0f}/{r['mem_total_gb']:.0f}G".rjust(9),
+                           util_color(mf * 100)),
+                          (g, ""),
+                          (f"  ours {v.get('ours_node', {}).get(node, 0)}/{C.node_cap(h, r)}", ""),
+                          (f"  room {C.node_room(h, v, node) if r['up'] else 0}", "")])
+    up = [n for n, h in poller.hosts.items() if h["enabled"] and (views.get(n) or {}).get("ok")]
+    ours = sum(views[n]["ours_cpus"] for n in up)
+    cap = sum(poller.hosts[n]["max_cpus"] for n in up)
+    free = sum(C.slots({"cpus": 1, "mem_gb": 0}, poller.hosts[n], views[n], {})[0] for n in up)
+    tc = sum(topo.get(n, {}).get("cores", 0) for n in up)
+    tt = sum(topo.get(n, {}).get("threads", 0) for n in up)
+    L.append([])
+    L.append([("━ total  ", "bold"),
+              (f"{len(up)}/{sum(h['enabled'] for h in poller.hosts.values())} hosts up  "
+               f"ours {ours:>2}/{cap} cpus  free now {free} cpus  [{tc}C{tt}T]", "")])
+    L.append([])
+    counts = {}
+    for j in jobs:
+        counts[j["state"]] = counts.get(j["state"], 0) + 1
+    L.append([("━ csched queue  ", "bold"), ("  ".join(f"{k} {v}" for k, v in counts.items()) or "empty", ""),
+              (f"   polled {ago(t)}" if t else "", "dim")]
+            + ([(f"   error: {err}", "red")] if err else []))
+    if jobs:
+        L.append([(f"   {'id':>4} {'state':9} {'tasks':>6} {'done':>6} {'run':>5} {'queue':>6} {'fail':>5} "
+                   f"{'cpus':>4} {'hosts':12} name", "dim")])
+    for j in jobs:
+        n = j["counts"]
+        L.append([(f"   {j['id']:>4} ", ""), (f"{j['state']:9}", CSTATE.get(j["state"], "")),
+                  (f" {j['ntasks']:>6} {n.get('done', 0):>6} {n.get('assigned', 0):>5} {n.get('queued', 0):>6} "
+                   f"{n.get('failed', 0):>5} {j['cpus']:>4} {(','.join(j['hosts']) or '-'):12} {j['name']}", ""),
+                  (f"  [bad: {','.join(json.loads(j['bad_hosts']))}]" if j["bad_hosts"] not in (None, "[]") else "",
+                   "dim")])
+    return L
+
+
 def jname(j):
     """Job name, prefixed with its client when it isn't ours (e.g. [my-agent])."""
     cl = G.client_of(j)
@@ -692,6 +855,7 @@ def job_log(jid, n=200):
 HELP = """gtop keys
   q            quit (or close this / the log view)
   j k ↓ ↑      scroll        PgDn PgUp  page        g G  top / bottom
+  Tab          GPU ↔ CPU (csched) page     C  CPU page     V  GPU page
   + -          probe interval up / down (now {iv:.1f}s)
   a            also list small / graphics processes (now {a})
   c            full command lines for your processes (now {c})
@@ -707,7 +871,13 @@ Other users' processes show only their process name. Hosts and thresholds come f
 Slurm hosts: only the cards your running GPU jobs hold, probed from inside each job by one
 `srun --overlap` step per job for the life of this gtop (GPU<n> = the node's real card index);
 refreshed every max(5 s, interval) at start, squeue every 15 s. For each node your jobs run on, one line from sinfo:
-state (* = not responding), CPUs and RAM allocated by Slurm (load = 1-min load), free GPUs by type, CPU model."""
+state (* = not responding), CPUs and RAM allocated by Slurm (load = 1-min load), free GPUs by type, CPU model.
+
+CPU page (csched): per enabled csched host (preferred first) a header with our cores / max_cpus and QUIET during
+quiet hours; node hosts a load bar and available RAM, Slurm hosts one line per node (CPU allocation bar,
+unallocated/total RAM, state). Below: the csched job table like `csched ls`, active jobs plus those ended in the
+last 24 h. csched's gather() ssh-probes every host, so it runs in a background thread every ~20 s, only while this
+page is shown; hosts come from csched's csched.toml."""
 
 
 # ---------------------------------------------------------------- UI
@@ -775,7 +945,7 @@ def prompt(scr, text):
     return s
 
 
-def ui(scr, poller, cfg):
+def ui(scr, poller, cpoller, cfg, start):
     init_styles()
     try:
         curses.curs_set(0)
@@ -785,31 +955,37 @@ def ui(scr, poller, cfg):
     opts = Opts()
     opts.history = True
     top, mode, logjob, loglines, logt = 0, "main", None, [], 0
+    page = start  # "gpu" or "cpu": Tab toggles, C / V pick one ('c' and 'g'/'G' are taken by cmd lines and scroll)
     last = 0
     while True:
         H, W = scr.getmaxyx()
         now = time.time()
-        if now - last >= 0.5 or poller.wake.is_set():
+        if now - last >= 0.5 or poller.wake.is_set() or cpoller.wake.is_set():
             poller.wake.clear()
+            cpoller.wake.clear()
             last = now
             if mode == "log" and now - logt > max(2, poller.interval):
                 loglines, logt = job_log(logjob, 500), now
+            cpoller.want = mode == "main" and page == "cpu"  # poll csched only while its page is on screen
             if mode == "main":
-                lines = build(poller, cfg, W, opts)
+                lines = build_cpu(cpoller, W) if page == "cpu" else build(poller, cfg, W, opts)
             elif mode == "log":
                 lines = [[(l.expandtabs(), "")] for l in loglines]
             else:
-                lines = [[(l, "")] for l in HELP.format(iv=poller.interval, a=opts.all_procs, c=opts.full_cmd).splitlines()]
+                lines = [[(l, "")] for l in HELP.format(iv=poller.interval, a=opts.all_procs, c=opts.full_cmd,
+                                                        p=page).splitlines()]
             top = max(0, min(top, len(lines) - (H - 1)))
-            sub = {"main": "", "log": f"  log of job {logjob}  (q back)", "help": "  help  (q back)"}[mode]
-            title = [(" gtop ", "bold"), (time.strftime("%H:%M:%S"), ""), (f"  every {poller.interval:.1f}s", "dim"),
-                     (sub, "cyan"), ("   q quit  h help  l log  a all  c cmd  +/- interval", "dim")]
+            sub = {"log": f"  log of job {logjob}  (q back)", "help": "  help  (q back)"}.get(
+                mode, "  csched CPU queue" if page == "cpu" else "")
+            title = [(" ctop " if page == "cpu" else " gtop ", "bold"), (time.strftime("%H:%M:%S"), ""),
+                     (f"  every {poller.interval:.1f}s", "dim"), (sub, "cyan"),
+                     ("   q quit  h help  TAB cpu/gpu  l log  a all  c cmd  +/- interval", "dim")]
             draw(scr, lines, top, title)
         k = scr.getch()
         if k == -1:
             continue
         last = 0  # redraw right away after a key
-        page = max(1, H - 2)
+        step = max(1, H - 2)  # PgDn / PgUp size (not `page`, which holds gpu/cpu)
         if k in (ord("q"), 27):
             if mode == "main":
                 return
@@ -819,9 +995,9 @@ def ui(scr, poller, cfg):
         elif k in (ord("k"), curses.KEY_UP):
             top = max(0, top - 1)
         elif k in (curses.KEY_NPAGE, ord(" ")):
-            top += page
+            top += step
         elif k == curses.KEY_PPAGE:
-            top = max(0, top - page)
+            top = max(0, top - step)
         elif k in (ord("g"), curses.KEY_HOME):
             top = 0
         elif k in (ord("G"), curses.KEY_END):
@@ -832,6 +1008,12 @@ def ui(scr, poller, cfg):
             poller.interval = max(1.0, poller.interval / 1.5)
         elif k == ord("a"):
             opts.all_procs = not opts.all_procs
+        elif k == ord("\t"):  # Tab: flip between the GPU and CPU pages
+            page, top = ("cpu" if page == "gpu" else "gpu"), 0
+        elif k == ord("C"):  # lowercase c is taken (full command lines), so uppercase picks the CPU page
+            page, top = "cpu", 0
+        elif k == ord("V"):  # lowercase g / G are taken (scroll), so this goes back to the GPU page
+            page, top = "gpu", 0
         elif k == ord("c"):
             opts.full_cmd = not opts.full_cmd
         elif k in (ord("h"), ord("?")):
@@ -853,8 +1035,10 @@ def main():
     ap.add_argument("--once", action="store_true", help="print one snapshot as plain text and exit")
     ap.add_argument("--json", action="store_true", help="print the raw per-host probe as JSON and exit")
     ap.add_argument("-a", "--all", action="store_true", help="also list small / graphics processes")
+    ap.add_argument("--cpu", action="store_true", help="start on the csched CPU page (also with --once / --json)")
     ap.add_argument("-w", "--width", type=int, help="line width for --once (default: terminal width)")
     a = ap.parse_args()
+    cpu = a.cpu or Path(sys.argv[0]).name == "ctop"  # a `ctop` entry point / symlink starts on the CPU page
     d, hosts = G.load_config()
     hosts = {n: h for n, h in hosts.items() if h["backend"] in ("node", "slurm")}
     if a.hosts:
@@ -864,23 +1048,36 @@ def main():
             sys.exit(f"unknown host(s) {', '.join(bad)}; known: {', '.join(hosts)}")
         hosts = {n: hosts[n] for n in want}
     poller = Poller(hosts, max(1.0, a.interval))
+    cpoller = CpuPoller()
     if a.json:
-        poller.once()
-        print(json.dumps({n: s for n, s in poller.state.items()}, indent=1, default=str))
+        if cpu:
+            cpoller.once()
+            with cpoller.lock:
+                print(json.dumps({"hosts": cpoller.state, "jobs": cpoller.jobs, "t": cpoller.t}, indent=1,
+                                 default=str))
+        else:
+            poller.once()
+            print(json.dumps({n: s for n, s in poller.state.items()}, indent=1, default=str))
         return
     if a.once:
-        poller.once()
         opts = Opts()
         opts.all_procs = a.all
         W = a.width or (os.get_terminal_size().columns if sys.stdout.isatty() else 160)
-        for segs in build(poller, (d, hosts), W, opts):
+        if cpu:
+            cpoller.once()
+            lines = build_cpu(cpoller, W)
+        else:
+            poller.once()
+            lines = build(poller, (d, hosts), W, opts)
+        for segs in lines:
             print("".join(t for t, _ in segs)[:W].rstrip())
         return
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
     poller.start()
+    cpoller.start()  # idles until the CPU page is shown
     try:
-        curses.wrapper(ui, poller, (d, hosts))
+        curses.wrapper(ui, poller, cpoller, (d, hosts), "cpu" if cpu else "gpu")
     except KeyboardInterrupt:
         pass
     finally:

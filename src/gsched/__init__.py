@@ -1,2 +1,2 @@
-"""gsched (GPU job queue over ssh + Slurm) and gtop (live GPU monitor for the same hosts)."""
-__version__ = "0.1.0"
+"""gsched (GPU job queue over ssh + Slurm) with gtop, and csched (CPU job queue) with ctop."""
+__version__ = "0.2.0"

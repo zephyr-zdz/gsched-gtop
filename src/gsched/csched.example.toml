@@ -1,0 +1,54 @@
+# csched hosts. One [hosts.<name>] block per machine; adding a server = adding a block.
+# The daemon rereads this file on every pass, so edits take effect without a restart.
+#
+# This queue hands out CPU cores and RAM (separate from gsched, which hands out GPUs).
+# pref: lower = filled first; every allowed host is filled in the same tick (CPU work has no reason to wait for a tier).
+# node hosts: free cores = min(max_cpus - ours, ncpu - reserve_cpus - foreign load - ours); RAM: MemAvailable - mem_reserve_gb.
+# slurm hosts: free task slots from sinfo (idle CPUs, unallocated RAM per node), capped at max_cpus of ours in Slurm
+# (running + pending). Slurm hosts need jobroot on a filesystem the compute nodes share.
+
+[defaults]
+poll_seconds = 30
+mem_per_cpu_gb = 2         # --mem default per task = this × --cpus
+max_batch = 8              # auto batch: at most this many tasks per lane (one Slurm array element / one xargs slot)
+retries = 2                # a task whose rc never appeared (node died, time limit) is requeued this often
+
+# The machine the controller runs on. `ssh = "local"` means no ssh: run commands here.
+[hosts.node1]
+backend = "node"
+ssh = "local"
+pref = 5
+max_cpus = 6               # at most this many cores used by csched at once
+reserve_cpus = 2           # cores kept free for everyone else
+mem_reserve_gb = 8
+home = "/home/me"
+
+# Another server reachable with passwordless ssh. It only needs bash, coreutils and python3.
+[hosts.node2]
+backend = "node"
+ssh = "me@node2.example.org"   # anything `ssh` accepts, incl. aliases from ~/.ssh/config
+# ssh_opts = ["-J", "jumphost"]
+pref = 6
+max_cpus = 8
+reserve_cpus = 4
+mem_reserve_gb = 16
+# quiet_hours = "01:00-08:00"   # controller's local time: no new shards; running ones paused (SIGSTOP/SIGCONT)
+home = "/home/me"
+# setup = "source ~/miniconda3/etc/profile.d/conda.sh"   # run before every task on this host
+
+# A Slurm cluster: one sbatch --array per shard, one element per lane.
+[hosts.cluster]
+backend = "slurm"
+ssh = "me@login.cluster.example.org"
+pref = 1
+max_cpus = 64             # our cores in Slurm (running + pending) at most
+node_frac = 1.0           # our cores on one node ≤ this × its cores
+cores_per_free_gpu = 0    # idle cores left per idle GPU on a node (for GPU users)
+partition = "cpu"
+home = "/home/me"
+jobroot = "/home/me/.local/state/csched/jobs"   # must be on a filesystem the compute nodes share
+default_time = "1-00:00:00"   # per lane (array element)
+local_disk = "ssd0:20"    # optional node-local scratch per lane: /scratch/ssd0 = $CSCHED_LOCAL; --local-disk
+setup = "module load python/3.11"
+
+# enabled = false           # keep it in `status` / ctop but never place work there

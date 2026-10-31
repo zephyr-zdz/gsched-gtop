@@ -1,6 +1,6 @@
 ---
 name: gsched
-description: Run GPU jobs through the user's gsched queue instead of picking a card by hand, and check GPU state with gtop. Use for any GPU job (training, evaluation, inference, sweeps), when the user asks which GPUs are free, or mentions gsched, gtop, GPU scheduling or queueing jobs on their servers or Slurm cluster.
+description: Run GPU jobs through the user's gsched queue instead of picking a card by hand, and check GPU state with gtop. Use for any GPU job (training, evaluation, inference, sweeps), when the user asks which GPUs are free, or mentions gsched, gtop, ctop, GPU scheduling or queueing jobs on their servers or Slurm cluster.
 ---
 
 # gsched + gtop
@@ -35,7 +35,17 @@ gsched submit --file jobs.jsonl                                    # one {"cmd":
   resume from checkpoints), `-e K=V`, `--setup-on HOST=CMD` (e.g. activate an environment on one host).
 - `-o PATH` (repeatable): path relative to the workdir copied back when the job ends. Write big outputs outside `~`
   if the user's server rules say so.
-- Slurm hosts: `--time 2-00:00:00`, `--slurm-exclude gn02`, `--queue-ahead`.
+- Slurm hosts: `--time 2-00:00:00`, `--slurm-exclude NODE`, `--queue-ahead`.
+- `--queue-ahead` [queue_ahead]: on a Slurm host with `queue_ahead = N` in hosts.toml, when no card is free the job
+  is sbatched anyway and waits PENDING in Slurm (any allowed card type), so it is in line for the next freed card
+  instead of racing other users' pending jobs. All our PENDING jobs per host are capped at `max_pending`
+  (default: `queue_ahead`, else 2), whatever the reason: don't squat on cards.
+- `--local-disk POOL:GiB[,POOL:GiB]` [local_disk]: Slurm node-local scratch. There is no default pool unless the host
+  sets `local_disk`; `none` turns it off. The pool is mounted at `/scratch/<pool>` = `$GSCHED_LOCAL` (also
+  `$GSCHED_LOCAL_<POOL>`); `TMPDIR`, `PYSCF_TMPDIR`, `GAUSS_SCRDIR`, `QCSCRATCH` and `PSI_SCRATCH` point to
+  `$GSCHED_LOCAL/tmp` unless `-e` sets them. **Private to the job and deleted when it ends**: copy what you need
+  into the workdir (and `-o` it back). Placement only picks a node with enough free space in each pool
+  (`gsched status` shows "disk free"). Use it for I/O-heavy work, many small files, or QM scratch.
 - In the command, `{home}`, `{workdir}` and `{host}` are replaced per host. The job gets `GSCHED_JOB`, `GSCHED_HOST`,
   `GSCHED_JOBDIR` and `CUDA_VISIBLE_DEVICES`.
 - An agent that submits on its own behalf can use `--client NAME`; `[clients.NAME] max_gpus = {host = n}` in
@@ -49,6 +59,16 @@ gsched show ID                  # full record incl. spec, host, GPUs, note
 gsched cancel ID... | gsched retry ID...
 ```
 After submitting, check `gsched ls` / `gsched logs ID` and tell the user where each job landed.
+
+## Slurm etiquette
+
+One Slurm job per gsched job, named after it (`sbatch -J` = the gsched job's name, sanitized; `--comment` =
+`gsched #<id> <client>`; there are no holder jobs). At most `max_pending` (default: `queue_ahead`, else 2) gsched
+jobs sit PENDING in Slurm per host, whatever the reason. A host may set `max_time`; `launch` clamps `--time` to it,
+and `submit` warns when `--time` exceeds it on every allowed Slurm host (node hosts have no limit). Give `--time`
+close to the real runtime, or leave it out: gsched estimates it from past jobs with the same name stem (1.5 × the
+max of the last 20, rounded to 30 min, 1 h – `max_time`; else the host's `default_time`) and warns when `--time` is
+over 3 × the estimate.
 
 ## Rules
 

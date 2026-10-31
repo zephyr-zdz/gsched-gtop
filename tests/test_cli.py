@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 
+from support import core
+
 
 class CLITests(unittest.TestCase):
     def test_queue_lifecycle_without_host_probes(self):
@@ -35,7 +37,7 @@ class CLITests(unittest.TestCase):
             job = json.loads(cli("show", "1").stdout)
             self.assertEqual((job["id"], job["name"], job["state"]), (1, "x", "queued"))
             self.assertEqual(job["spec"]["cmd"], "echo hi")
-            self.assertEqual(job["spec"]["workdir"], str(root))
+            self.assertEqual(job["spec"]["workdir"], core.homeform(str(root)))
             self.assertIsNone(job["host"])
             self.assertIn("cancelled", cli("cancel", "1").stdout)
             job = json.loads(cli("show", "1").stdout)

@@ -1,0 +1,18 @@
+# systemd user unit for the csched controller.
+#   cp examples/csched.service ~/.config/systemd/user/ && systemctl --user enable --now csched
+# (`loginctl enable-linger $USER` keeps it running while you are logged out.)
+[Unit]
+Description=csched CPU job queue controller
+After=network-online.target
+
+[Service]
+# where `pip install` / `uv tool install` put the csched script
+ExecStart=%h/.local/bin/csched daemon
+Restart=always
+# only the daemon: shards it started on this host (setsid) must survive a restart
+KillMode=process
+RestartSec=30
+Nice=5
+
+[Install]
+WantedBy=default.target

@@ -1,8 +1,10 @@
-# gsched / gtop
+# gsched / gtop / csched / ctop
 
 [中文说明](README.zh-CN.md)
 
 gsched is a personal or small-team GPU job queue for a few servers reached over SSH, with optional Slurm overflow. A controller polls hosts, debounces idle GPUs, observes other users' processes without touching them, and places jobs by tier with fallback and balancing. Small jobs that declare `--gpu-mem` can share a card. It rsyncs workdirs to hosts, tracks execution, fetches logs and declared outputs, and can requeue jobs lost after a reboot with `--retries`. For Slurm, it checks for a node with enough GPUs, CPUs, and RAM before calling sbatch, or optionally queues ahead. gtop is an nvtop-like live curses monitor for these hosts and the cards held by your running Slurm jobs, using `srun --overlap`; it associates processes with gsched jobs where identifiable. Both programs use only Python's standard library. No gsched installation is needed remotely: probes use python3 and nvidia-smi, alongside the Linux tools used for execution and transfers.
+
+`csched` is the CPU counterpart: one command run for N tasks, cut into shards by free cores and RAM on node hosts and Slurm clusters, with the same ssh + rsync workflow. `ctop` is gtop's CPU page (the `ctop` entry point, `gtop --cpu`, or Tab in gtop).
 
 - **No cluster software needed**: one controller, plain ssh + rsync to each GPU server, Python stdlib only, nothing
   installed on the servers.
@@ -14,6 +16,7 @@ gsched is a personal or small-team GPU job queue for a few servers reached over 
 - **Quiet hours**, per-client GPU caps, priorities, retries after a reboot, JSONL batch submit.
 - **gtop**: one screen for every GPU on every host, which process belongs to which job, plus the cards your Slurm jobs
   hold, and the queue.
+- **csched / ctop**: a separate CPU queue (tasks, task files, node-local scratch) and its live CPU page.
 
 ```text
  gtop 14:02:11  every 2.0s
@@ -48,7 +51,7 @@ pipx install git+https://github.com/zephyr-zdz/gsched-gtop
 pip install --user git+https://github.com/zephyr-zdz/gsched-gtop
 ```
 
-Make sure the installed `gsched` and `gtop` commands are on your PATH.
+Make sure the installed `gsched`, `gtop`, `csched` and `ctop` commands are on your PATH.
 Configure SSH key authentication so each remote host works without a password prompt. SSH aliases and options from your SSH configuration work; a host can also set `ssh_opts`.
 The controller needs ssh and rsync. Remote nodes need python3, nvidia-smi,
 rsync for transfers, and normal Linux utilities such as bash, setsid, nohup, ps, and tail.
@@ -65,6 +68,11 @@ gsched init
 ${EDITOR:-vi} ~/.config/gsched/hosts.toml
 gsched status
 gtop
+
+csched init
+${EDITOR:-vi} ~/.config/gsched/csched.toml
+csched status
+ctop
 ```
 
 The generated example includes a local node and a placeholder SSH server. Remove or replace hosts you do not use. Set `home` when your remote home differs,
@@ -117,7 +125,9 @@ Check the unit's `ExecStart` if your command is installed somewhere other than
 running after logout, where permitted. The example uses `KillMode=process`
 so restarting the controller does not kill local jobs it has started.
 Alternatively, invoke `gsched tick` manually or from cron, using an absolute
-executable path. The default daemon polling interval is 60 seconds.
+executable path. The default daemon polling interval is 60 seconds. `csched` has
+its own unit, [`examples/csched.service`](examples/csched.service); install and
+enable it the same way (`systemctl --user enable --now csched`).
 
 ## Submit jobs
 
@@ -321,6 +331,8 @@ raw per-host probe state, including errors. `--hosts` selects comma-separated
 hosts to poll; omitted Slurm hosts can still appear as unpolled queue summaries.
 `-d` / `--interval` sets the node probe interval (default 2 seconds, minimum 1).
 `-a` / `--all` includes small and graphics processes in a text snapshot.
+`--cpu` starts on the csched CPU page (also with `--once` / `--json`); the
+`ctop` entry point does the same.
 
 | Key | Action |
 | --- | --- |
@@ -332,6 +344,8 @@ hosts to poll; omitted Slurm hosts can still appear as unpolled queue summaries.
 | `a` | Toggle small and graphics processes. |
 | `c` | Toggle full command lines for your processes. |
 | `l` | Ask for a gsched job ID and display its log. |
+| Tab | Switch between the GPU and CPU (csched) pages. |
+| `C` / `V` | Go to the CPU / GPU page directly. |
 | `h` / `?` | Show help. |
 
 GPU rows show utilization, memory, temperature, power draw/limit, and live
@@ -350,6 +364,96 @@ lasts for the session, rather than a new step per refresh. A failed step may be
 restarted. Steps appear in accounting and count toward MaxStepCount.
 The Slurm probe interval is fixed at startup to max(5 seconds, requested interval). Node summaries show Slurm-allocated CPUs/RAM and free GPUs, not just process use. gtop reads gsched's SQLite database without writing it or taking the tick lock.
 
+
+## csched / ctop (CPU queue)
+
+`csched` is a separate queue for CPU cores and RAM. A job is one command run for
+N tasks (`-N N`, or one task per line of `--task-file`); each task gets `-c`
+cores and `--mem` GiB. Every pass it probes the enabled hosts, slices the queued
+tasks into shards by free capacity, launches them, and fetches results back.
+
+```sh
+csched init                    # write ~/.config/gsched/csched.toml
+csched submit -n sweep -C . -N 12 -c 2 -o results/ -- python sweep.py {i}
+csched submit -n mols -C . --hosts cluster -c 4 --task-file mols.txt -- bash run.sh {arg}
+csched status                  # free cores / RAM per host; per-node lines on Slurm
+csched ls [-a]                 # active + last 24 h jobs
+csched plan                    # what the next pass would start where
+csched show ID | tasks ID [--state S] | logs ID [TASK] [-n N]
+csched cancel ID... | retry ID... | tick | daemon
+```
+
+Task variables: `$CSCHED_ARG` (the task-file line, `{arg}` in the command),
+`$CSCHED_TASK` (`{i}`), `$CSCHED_JOB`, `$CSCHED_SHARD`, `$CSCHED_HOST`,
+`$CSCHED_JOBDIR`, `$CSCHED_CPUS`, `$CSCHED_NTASKS`. `{home}`, `{workdir}` and
+`{host}` are replaced per host, and `OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS` are
+set to the task's core count.
+
+- Node hosts run a shard under `xargs -P <lanes>` in a setsid process group.
+  Slurm hosts submit one `sbatch --array` per shard, one element per lane, pinned
+  to one node (`--nodelist`) when the placement code picked one.
+- `pref` orders hosts (lower first), but every allowed host is filled in the
+  same pass. Node room is capped by `max_cpus`, `reserve_cpus` and current load;
+  Slurm room per node is `node_frac` of its cores minus `cores_per_free_gpu` per
+  idle GPU. `--max-cpus` caps a single job's concurrency.
+- `-C DIR` is rsynced to each allowed host once per job; `-o PATH` is copied back
+  after each shard. `--no-sync`, `--sync-path`, `--exclude` work as in gsched.
+- A task whose rc never appears (node died, time limit) is requeued `--retries`
+  times (default from `[defaults]`). A real nonzero exit is not retried
+  automatically; use `csched retry ID`. A shard that fails completely with
+  rc 97/126/127, or while the same job succeeds elsewhere, marks that host bad
+  for the job and moves its tasks to the remaining hosts.
+- Slurm `--local-disk POOL:GiB[,POOL:GiB]` (or a host's `local_disk`) mounts
+  node-local scratch at `/scratch/<pool>` as `$CSCHED_LOCAL`; `TMPDIR` and common
+  QM scratch variables point to `$CSCHED_LOCAL/tmp` unless set with `-e`. There
+  is no default pool unless the host configures one. Scratch is private to the
+  lane and deleted when it ends, so copy results out with `-o`.
+
+A minimal `~/.config/gsched/csched.toml`:
+
+```toml
+[defaults]
+poll_seconds = 30
+mem_per_cpu_gb = 2
+max_batch = 8
+retries = 2
+
+[hosts.node1]                 # the controller's own machine
+backend = "node"
+ssh = "local"
+pref = 5
+max_cpus = 6
+reserve_cpus = 2
+mem_reserve_gb = 8
+home = "/home/me"
+
+[hosts.node2]
+backend = "node"
+ssh = "me@node2.example.org"
+pref = 6
+max_cpus = 8
+home = "/home/me"
+
+[hosts.cluster]               # optional Slurm cluster
+backend = "slurm"
+ssh = "me@login.cluster.example.org"
+pref = 1
+max_cpus = 64
+node_frac = 1.0
+cores_per_free_gpu = 0
+partition = "cpu"
+home = "/home/me"
+jobroot = "/home/me/.local/state/csched/jobs"   # shared with the compute nodes
+default_time = "1-00:00:00"
+# local_disk = "ssd0:20"
+```
+
+`ctop` (or Tab in gtop) shows per enabled csched host: our cores / `max_cpus`,
+QUIET during quiet hours, a load bar and available RAM on node hosts, and one
+line per Slurm node with CPU allocation, unallocated RAM and state. Below is the
+csched job table (active plus the last 24 h), like `csched ls`. The csched probe
+runs in a background thread only while the CPU page is visible.
+
 ## Files and environment
 
 | Setting / path | Purpose |
@@ -360,6 +464,10 @@ The Slurm probe interval is fixed at startup to max(5 seconds, requested interva
 | `gsched.db` in state | SQLite jobs and host idle history, using WAL mode. |
 | `tick.lock` in state | Serializes scheduling passes and cancellation. |
 | Host `jobroot` | Remote job directories, one numeric ID per job; defaults to the remapped local work path. |
+| `CSCHED_CONFIG` | csched config; default `~/.config/gsched/csched.toml`. |
+| `CSCHED_STATE` | csched state directory; default `~/.local/state/csched`. |
+| `CSCHED_WORK` | csched job directories and logs; default `$CSCHED_STATE/jobs`. |
+| `csched.db`, `topology.json` | csched jobs/shards/tasks and the cached CPU topology. |
 | `~/.ssh/gsched-%C` | SSH ControlMaster sockets; connections persist for five minutes. |
 
 Config and state defaults honor `XDG_CONFIG_HOME` and `XDG_STATE_HOME`.
@@ -370,7 +478,8 @@ jobs are active. Use one controller and one state directory for a queue.
 
 ## Using AI coding agents
 
-`gtop --once -w 160`, `gtop --json`, `gsched ls`, and `gsched status` work without
+`gtop --once -w 160`, `gtop --json`, `gtop --cpu --once`, `gsched ls`, `gsched status`,
+`csched ls`, and `csched status` work without
 an interactive terminal. An agent can inspect capacity, submit with
 `--client my-agent`, and check IDs, states, notes, and logs. Configure its own
 `[clients.my-agent]` cap to limit how many cards it can occupy.
@@ -378,8 +487,8 @@ an interactive terminal. An agent can inspect capacity, submit with
 ## Claude Code skill
 
 [`skills/gsched/SKILL.md`](skills/gsched/SKILL.md) teaches a Claude Code agent to run GPU work through gsched instead
-of picking cards by hand. Copy the folder to `~/.claude/skills/` (or a project's `.claude/skills/`) and adapt the
-rules section to your servers.
+of picking cards by hand; [`skills/csched/SKILL.md`](skills/csched/SKILL.md) does the same for CPU work. Copy the
+folders to `~/.claude/skills/` (or a project's `.claude/skills/`) and adapt the rules section to your servers.
 
 ## Tests
 
@@ -387,8 +496,8 @@ rules section to your servers.
 python -m unittest discover -s tests -v
 ```
 
-The tests cover parsing, placement, packing, client caps, quiet hours, reservations and a CLI round trip; none of
-them needs a GPU or ssh.
+The tests cover parsing, placement, packing, client caps, quiet hours, reservations, csched config/placement/task
+files/scripts, the ctop CPU page and CLI round trips; none of them needs a GPU or ssh.
 
 ## Limits and license
 

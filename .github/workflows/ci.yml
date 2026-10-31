@@ -22,3 +22,5 @@ jobs:
         run: |
           gsched --version
           gtop --help
+          csched --version
+          ctop --help

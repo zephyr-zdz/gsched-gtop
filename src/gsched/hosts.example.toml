@@ -51,8 +51,12 @@ gpu_types = ["A6000"]
 # gres_types = { H100 = "h100_sxm" }    # gsched card type -> Slurm GRES type, where they differ
 # gpu_labels = { "gn03:A100" = "A100-80G" }   # status/gtop labels for GRES types that hide variants
 # cpu_models = { gn03 = "2x EPYC 9354" }    # shown by status/gtop
-# default_time = "1-00:00:00"
+# default_time = "1-00:00:00"   # sbatch -t when no runtime estimate exists yet
+# max_time = "1-00:00:00"       # hard ceiling for our jobs; launch clamps --time to it
+# local_disk = "ssd0:50"        # optional node-local scratch per job (POOL:GiB[,POOL:GiB]), /scratch/<pool>
+#                               # = $GSCHED_LOCAL; no default pool unless set here or with --local-disk
 # queue_ahead = 1          # jobs submitted with --queue-ahead may wait PENDING in Slurm, at most 1 at a time
+# max_pending = 2          # cap on all our PENDING jobs here (default: queue_ahead, else 2)
 # home = "/home/me"
 # setup = "source ~/miniconda3/etc/profile.d/conda.sh"
 

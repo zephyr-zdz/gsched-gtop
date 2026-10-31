@@ -1,8 +1,10 @@
-# gsched / gtop
+# gsched / gtop / csched / ctop
 
 [English](README.md)
 
 gsched 是面向个人或小团队的 GPU 作业队列，适用于通过 SSH 访问的少量服务器，也可将作业分流到 Slurm。控制器会轮询主机，确认 GPU 持续空闲一段时间后再分配作业；它只观察其他用户的进程，不做干预，并按层级调度，支持回退和负载均衡。声明了 `--gpu-mem` 的小作业可以共用一张卡。gsched 通过 rsync 将工作目录同步到主机，跟踪执行状态，取回日志和指定输出；设置 `--retries` 后，还能将因重启而丢失的作业重新入队。对于 Slurm，它会先检查是否有节点同时满足 GPU、CPU 和内存需求，再调用 sbatch，也可选择提前排队。gtop 是类似 nvtop 的实时 curses 监控工具，可查看这些主机，以及通过 `srun --overlap` 监控正在运行的 Slurm 作业所占用的显卡；在能够识别时，它会将进程关联到 gsched 作业。两个程序都只依赖 Python 标准库。远程主机无需安装 gsched：探测使用 python3 和 nvidia-smi，执行和传输则使用常见 Linux 工具。
+
+`csched` 是 CPU 版本的队列：一条命令运行 N 个任务，按节点主机和 Slurm 集群的空闲核心与内存切成 shard，沿用同样的 ssh + rsync 工作流。`ctop` 是 gtop 的 CPU 页面（`ctop` 入口、`gtop --cpu`，或在 gtop 中按 Tab）。
 
 - **无需集群软件**：一个控制器，通过普通 ssh + rsync 连接各台 GPU 服务器，只依赖 Python 标准库，服务器上无需
   安装 gsched。
@@ -48,7 +50,7 @@ pipx install git+https://github.com/zephyr-zdz/gsched-gtop
 pip install --user git+https://github.com/zephyr-zdz/gsched-gtop
 ```
 
-确保安装后的 `gsched` 和 `gtop` 命令位于 PATH 中。
+确保安装后的 `gsched`、`gtop`、`csched` 和 `ctop` 命令位于 PATH 中。
 配置 SSH 密钥认证，确保连接各台远程主机时无需输入密码。支持 SSH 配置中的别名和选项；也可以为主机设置 `ssh_opts`。
 控制器需要 ssh 和 rsync。远程节点需要 python3、nvidia-smi、
 用于传输的 rsync，以及 bash、setsid、nohup、ps、tail 等常见 Linux 工具。
@@ -65,6 +67,11 @@ gsched init
 ${EDITOR:-vi} ~/.config/gsched/hosts.toml
 gsched status
 gtop
+
+csched init
+${EDITOR:-vi} ~/.config/gsched/csched.toml
+csched status
+ctop
 ```
 
 生成的示例包含一个本地节点和一个占位 SSH 服务器。删除或替换不使用的主机。如果远程主目录不同，请设置 `home`，
@@ -112,6 +119,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now gsched
 ```
 
+`csched` 也有自己的服务单元 [`examples/csched.service`](examples/csched.service)，安装和启用方式相同
+（`systemctl --user enable --now csched`）。
 如果命令安装在 `~/.local/bin/gsched` 以外的位置，
 请检查服务单元中的 `ExecStart`。在系统允许的情况下，`loginctl enable-linger "$USER"` 可让用户服务
 在退出登录后继续运行。示例使用 `KillMode=process`，
@@ -321,6 +330,7 @@ gtop --interval 5
 以逗号分隔；未选中的 Slurm 主机仍可能以未经轮询的队列摘要形式显示。
 `-d` / `--interval` 设置节点探测间隔（默认 2 秒，最短 1 秒）。
 `-a` / `--all` 在文本快照中包含小进程和图形进程。
+`--cpu` 从 csched 的 CPU 页面启动（`--once` / `--json` 同样适用）；`ctop` 入口效果相同。
 
 | 按键 | 操作 |
 | --- | --- |
@@ -332,6 +342,8 @@ gtop --interval 5
 | `a` | 切换是否显示小进程和图形进程。 |
 | `c` | 切换是否显示自己进程的完整命令行。 |
 | `l` | 输入 gsched 作业 ID 并显示日志。 |
+| Tab | 在 GPU 页面和 CPU（csched）页面之间切换。 |
+| `C` / `V` | 直接切换到 CPU / GPU 页面。 |
 | `h` / `?` | 显示帮助。 |
 
 GPU 行显示利用率、显存、温度、功耗/功率上限，以及实时
@@ -350,6 +362,91 @@ RSS 和作业/命令。其他用户的进程只显示进程名。
 重新启动。这些步骤会出现在作业统计中，并计入 MaxStepCount。
 Slurm 探测间隔在启动时固定为 5 秒与请求间隔中的较大值。节点摘要显示 Slurm 已分配的 CPU/内存和空闲 GPU，而不只是进程用量。gtop 只读取 gsched 的 SQLite 数据库，不写入，也不获取 tick 锁。
 
+## csched / ctop（CPU 队列）
+
+`csched` 是独立的 CPU 核心与内存队列。一个作业是一条命令运行 N 个任务
+（`-N N`，或 `--task-file` 每行一个任务）；每个任务使用 `-c` 个核心和 `--mem` GiB。
+每轮它会探测启用的主机，按空闲容量把排队任务切成 shard，启动并取回结果。
+
+```sh
+csched init                    # 写入 ~/.config/gsched/csched.toml
+csched submit -n sweep -C . -N 12 -c 2 -o results/ -- python sweep.py {i}
+csched submit -n mols -C . --hosts cluster -c 4 --task-file mols.txt -- bash run.sh {arg}
+csched status                  # 每台主机的空闲核心/内存；Slurm 会列出每个节点
+csched ls [-a]                 # 活跃作业 + 最近 24 小时
+csched plan                    # 下一轮会启动什么（无副作用）
+csched show ID | tasks ID [--state S] | logs ID [TASK] [-n N]
+csched cancel ID... | retry ID... | tick | daemon
+```
+
+任务变量：`$CSCHED_ARG`（任务文件中的一行，命令里写 `{arg}`）、
+`$CSCHED_TASK`（`{i}`）、`$CSCHED_JOB`、`$CSCHED_SHARD`、`$CSCHED_HOST`、
+`$CSCHED_JOBDIR`、`$CSCHED_CPUS`、`$CSCHED_NTASKS`。`{home}`、`{workdir}` 和
+`{host}` 会按主机替换，`OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS` 会设成任务的
+核心数。
+
+- 节点主机在 setsid 进程组中通过 `xargs -P <lanes>` 运行 shard。Slurm 主机为
+  每个 shard 提交一个 `sbatch --array`，每个 lane 一个数组元素；如果调度器
+  选定了节点，就用 `--nodelist` 固定到该节点。
+- `pref` 决定主机顺序（越小越先），但同一轮会填满所有允许的主机。节点主机
+  受 `max_cpus`、`reserve_cpus` 和当前负载限制；Slurm 每个节点的上限是
+  `node_frac` × 核心数，再为每张空闲 GPU 保留 `cores_per_free_gpu` 个核心。
+  `--max-cpus` 限制单个作业的并发。
+- `-C DIR` 每个作业只向每台允许的主机 rsync 一次；`-o PATH` 在每个 shard 结束后
+  取回。`--no-sync`、`--sync-path`、`--exclude` 与 gsched 相同。
+- 任务没有写出 rc（节点死亡、超时）时按 `--retries` 重新入队（默认来自
+  `[defaults]`）。真正的非零退出不会自动重试，请用 `csched retry ID`。若整个
+  shard 以 rc 97/126/127 失败，或同一作业在其他主机成功，则把该主机标记为
+  此作业的坏主机，任务转到其余主机。
+- Slurm 的 `--local-disk POOL:GiB[,POOL:GiB]`（或主机的 `local_disk`）会把节点
+  本地盘挂到 `/scratch/<pool>`，即 `$CSCHED_LOCAL`；`TMPDIR` 和常见 QM 临时变量
+  指向 `$CSCHED_LOCAL/tmp`（用 `-e` 设置时除外）。除非主机配置，否则没有默认
+  磁盘池。scratch 只属于该 lane，结束后删除，请用 `-o` 取回结果。
+
+`~/.config/gsched/csched.toml` 最小示例：
+
+```toml
+[defaults]
+poll_seconds = 30
+mem_per_cpu_gb = 2
+max_batch = 8
+retries = 2
+
+[hosts.node1]                 # 控制器所在机器
+backend = "node"
+ssh = "local"
+pref = 5
+max_cpus = 6
+reserve_cpus = 2
+mem_reserve_gb = 8
+home = "/home/me"
+
+[hosts.node2]
+backend = "node"
+ssh = "me@node2.example.org"
+pref = 6
+max_cpus = 8
+home = "/home/me"
+
+[hosts.cluster]               # 可选 Slurm 集群
+backend = "slurm"
+ssh = "me@login.cluster.example.org"
+pref = 1
+max_cpus = 64
+node_frac = 1.0
+cores_per_free_gpu = 0
+partition = "cpu"
+home = "/home/me"
+jobroot = "/home/me/.local/state/csched/jobs"   # 计算节点必须能访问
+default_time = "1-00:00:00"
+# local_disk = "ssd0:20"
+```
+
+`ctop`（或 gtop 中按 Tab）显示每台启用的 csched 主机：已用核心 / `max_cpus`、
+静默时段的 QUIET、节点主机的负载条和可用内存，以及每个 Slurm 节点的 CPU 分配、
+未分配内存和状态。下方是 csched 作业表（活跃 + 最近 24 小时），类似
+`csched ls`。csched 探测只在 CPU 页面显示时于后台线程运行。
+
 ## 文件与环境
 
 | 设置 / 路径 | 用途 |
@@ -360,6 +457,10 @@ Slurm 探测间隔在启动时固定为 5 秒与请求间隔中的较大值。�
 | 状态目录中的 `gsched.db` | 存储作业和主机空闲历史的 SQLite 数据库，使用 WAL 模式。 |
 | 状态目录中的 `tick.lock` | 保证各轮调度与取消操作串行执行。 |
 | 主机的 `jobroot` | 远程作业目录，每个作业使用一个数字 ID 目录；默认为映射后的本地作业路径。 |
+| `CSCHED_CONFIG` | csched 配置；默认为 `~/.config/gsched/csched.toml`。 |
+| `CSCHED_STATE` | csched 状态目录；默认为 `~/.local/state/csched`。 |
+| `CSCHED_WORK` | csched 作业目录和日志；默认为 `$CSCHED_STATE/jobs`。 |
+| `csched.db`、`topology.json` | csched 作业/shard/任务和缓存的 CPU 拓扑。 |
 | `~/.ssh/gsched-%C` | SSH ControlMaster 套接字；连接保持五分钟。 |
 
 配置和状态目录的默认值遵循 `XDG_CONFIG_HOME` 和 `XDG_STATE_HOME`。
@@ -370,7 +471,8 @@ Slurm 探测间隔在启动时固定为 5 秒与请求间隔中的较大值。�
 
 ## 使用 AI 编程智能体
 
-`gtop --once -w 160`、`gtop --json`、`gsched ls` 和 `gsched status` 无需
+`gtop --once -w 160`、`gtop --json`、`gtop --cpu --once`、`gsched ls`、`gsched status`、
+`csched ls` 和 `csched status` 无需
 交互式终端即可运行。智能体可以查看容量，使用
 `--client my-agent` 提交，并检查 ID、状态、备注和日志。为它单独配置
 `[clients.my-agent]` 配额，即可限制其占用的显卡数量。
@@ -378,8 +480,8 @@ Slurm 探测间隔在启动时固定为 5 秒与请求间隔中的较大值。�
 ## Claude Code 技能
 
 [`skills/gsched/SKILL.md`](skills/gsched/SKILL.md) 指导 Claude Code 智能体通过 gsched 运行 GPU 任务，
-无需手动选择显卡。将该文件夹复制到 `~/.claude/skills/`（或项目的 `.claude/skills/`），并根据
-服务器情况调整规则部分。
+无需手动选择显卡；[`skills/csched/SKILL.md`](skills/csched/SKILL.md) 则用于 CPU 任务。将这些文件夹复制到
+`~/.claude/skills/`（或项目的 `.claude/skills/`），并根据服务器情况调整规则部分。
 
 ## 测试
 
@@ -387,8 +489,8 @@ Slurm 探测间隔在启动时固定为 5 秒与请求间隔中的较大值。�
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖解析、分配、显卡共享、客户端配额、静默时段、预约，以及完整的命令行流程；所有测试
-均无需 GPU 或 ssh。
+测试覆盖解析、分配、显卡共享、客户端配额、静默时段、预约、csched 配置/调度/任务文件/脚本、ctop CPU 页面，
+以及完整的命令行流程；所有测试均无需 GPU 或 ssh。
 
 ## 限制与许可证
 

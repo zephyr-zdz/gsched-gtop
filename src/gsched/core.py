@@ -213,6 +213,25 @@ def parse_gres(s):
     return r
 
 
+LOCALDISK = re.compile(r"localdisk:([A-Za-z0-9_]+):(\d+)([KMGTP]?)")
+
+
+def parse_localdisk(s):
+    """Node-local scratch pools in sinfo Gres/GresUsed ("localdisk:ssd0:400G") -> {pool: GiB}."""
+    return {pool: int(n) * 1024 ** "KMGTP".find(u) / 1024 ** 2 if u else int(n) / 1024 ** 3
+            for pool, n, u in LOCALDISK.findall(s)}
+
+
+def local_disk_spec(spec, h):
+    """The job's node-local scratch request on a Slurm host: [(pool, GiB), ...]. --local-disk beats the host default
+    `local_disk`; "none" turns it off, and there is no default pool unless the host configures one.
+    Format "ssd0:50" or "ssd0:50,hdd0:500"."""
+    v = spec.get("local_disk") or h.get("local_disk") or "none"
+    if h["backend"] != "slurm" or v == "none":
+        return []
+    return [(pool, int(gb)) for pool, gb in (x.split(":") for x in v.split(","))]
+
+
 # ---------------------------------------------------------------- capacity model
 
 def node_view(h, p, d, prev, now, mine_jobs, reserved=None):
@@ -376,6 +395,12 @@ def place_node(spec, h, v, taken, d):
 
 
 def place_slurm(spec, h, v, taken):
+    # at most max_pending (default: queue_ahead, else 2) of our Slurm jobs may sit PENDING on this host, whatever
+    # the reason: even a free-card placement can end up PENDING, because Slurm gives the card to a higher-priority
+    # pending job. Placements planned earlier in this pass count too (they may pend), so at most this many new
+    # sbatches go out per pass — fine, the daemon ticks every poll_seconds. Queue properly, don't squat on cards.
+    if v["pending"] + len(taken) >= (h.get("max_pending") or h.get("queue_ahead") or 2):
+        return None
     mine = v["mine_gpus"] + sum(t["n"] for t in taken)
     want = spec.get("gpus", 1)
     if mine + want > h["max_gpus"]:
@@ -383,6 +408,7 @@ def place_slurm(spec, h, v, taken):
     types = [spec["gpu_type"]] if spec.get("gpu_type") else h.get("gpu_types") or ["gpu"]
     cpus, mem = spec.get("cpus", 4), spec.get("mem_gb", 0)
     skip = set((spec.get("slurm_exclude") or "").split(","))
+    disk = local_disk_spec(spec, h)
     for rank, t in enumerate(types):
         for node, r in sorted(v["nodes"].items()):  # one node must hold the GPUs, CPUs and RAM together
             if node in skip or not r["up"]:
@@ -390,8 +416,11 @@ def place_slurm(spec, h, v, taken):
             here = [x for x in taken if x.get("node") == node]
             free = r["free"].get(h.get("gres_types", {}).get(t, t), 0) - sum(x["n"] for x in here if x["type"] == t)
             if (free >= want and r["cpu_idle"] - sum(x.get("cpus", 0) for x in here) >= cpus
-                    and r["mem_unalloc_gb"] - sum(x.get("mem_gb", 0) for x in here) >= mem):
-                return h["name"], {"type": t, "n": want, "node": node, "cpus": cpus, "mem_gb": mem}, (2, rank, 0)
+                    and r["mem_unalloc_gb"] - sum(x.get("mem_gb", 0) for x in here) >= mem
+                    and all(r.get("disk_free", {}).get(pool, 0) - sum(x.get("disk", {}).get(pool, 0) for x in here) >= gb
+                            for pool, gb in disk)):
+                return h["name"], {"type": t, "n": want, "node": node, "cpus": cpus, "mem_gb": mem,
+                                   "disk": dict(disk)}, (2, rank, 0)
     # queue ahead (opt-in per job, capped per host by `queue_ahead`): no card free now, so get in line in Slurm instead
     # of racing other users' pending jobs for the next freed card; any allowed type, Slurm picks the node
     if spec.get("queue_ahead") and h.get("queue_ahead", 0):
@@ -412,6 +441,8 @@ def slurm_view(p):
         tot, used = parse_gres(f[1]), parse_gres(f[2])
         r = {"state": f[3], "up": any(s in f[3] for s in ("idle", "mix")) and "*" not in f[3],  # *: not responding
              "free": {t: tot[t] - used.get(t, 0) for t in tot}, "gres": tot}
+        dt, du = parse_localdisk(f[1]), parse_localdisk(f[2])
+        r["disk_total"], r["disk_free"] = dt, {k: dt[k] - du.get(k, 0) for k in dt}
         try:
             a, i, o, t = (int(x) for x in f[4].split("/"))
             r.update(cpu_alloc=a, cpu_idle=i, cpu_total=t,
@@ -437,7 +468,19 @@ def scripts(spec, h, jobdir, jid, gpus):
     cmd = spec["cmd"].replace("{home}", h["home"]).replace("{workdir}", wd).replace("{host}", h["name"])
     setup = "\n".join(s for s in (h["setup"], spec.get("setup_on", {}).get(h["name"], "")) if s)
     setup = setup.replace("{home}", h["home"]).replace("{workdir}", wd).replace("{host}", h["name"])  # as in the command
-    run = ("#!/bin/bash\n" + "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in env.items())
+    local = ""
+    for i, (pool, _) in enumerate(local_disk_spec(spec, h)):
+        # each requested pool is mounted at /scratch/<pool>, private to the job and deleted when it ends.
+        # GSCHED_LOCAL = the first pool; TMPDIR and QM scratch go there unless the job set them itself.
+        d = f"/scratch/{pool}"
+        local += f"export GSCHED_LOCAL_{pool.upper()}={d}\n"
+        if i == 0:
+            tmp = {k: f"{d}/tmp" for k in ("TMPDIR", "PYSCF_TMPDIR", "GAUSS_SCRDIR", "QCSCRATCH", "PSI_SCRATCH")
+                   if k not in spec.get("env", {})}
+            local += (f"if mkdir -p {d}/tmp 2>/dev/null; then export GSCHED_LOCAL={d}\n"
+                      + "".join(f"  export {k}={v}\n" for k, v in tmp.items())
+                      + f"else echo 'gsched: {d} not writable, using defaults' >&2; fi\n")
+    run = ("#!/bin/bash\n" + "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in env.items()) + local
            + f"{setup}\ncd {shlex.quote(wd)} || exit 97\n{cmd}\n")
     q = shlex.quote(jobdir)
     wrap = (f"#!/bin/bash\necho $$ > {q}/pid\ndate +%s > {q}/start\ntrap true TERM INT HUP\n"
@@ -500,6 +543,73 @@ def start_staging(c, j, h):
     upd(c, j["id"], state="staging", note="syncing workdir")
 
 
+def stem_of(name):
+    """A job name's stem: the trailing run of index suffixes stripped repeatedly (run-4 and run-12 share the stem run)."""
+    while True:
+        s = re.sub(r"[-_]?\d+[A-Za-z]*$", "", name)
+        if s == name:
+            return name
+        name = s
+
+
+def est_secs(c, name, h):
+    """Runtime estimate in seconds for a job called `name` on Slurm host h, from this DB's finished jobs
+    (state 'done', rc 0) whose name has the same stem: 1.5 x the max of the last 20 runtimes, rounded up to
+    30 min, clamped to [1 h, max_time]. None with fewer than 2 samples."""
+    if h.get("backend") != "slurm":
+        return None
+    runs = sorted(r["ended"] - r["started"] for r in c.execute(
+        "select started, ended, name from jobs where state='done' and rc=0 and host=? "
+        "and started is not null and ended is not null", (h["name"],))
+        if stem_of(r["name"] or "") == stem_of(name or ""))
+    if len(runs) < 2:
+        return None
+    est = -(-int(1.5 * max(runs[-20:])) // 1800) * 1800  # round up to 30 min
+    return min(max(est, 3600), time_secs(h["max_time"]) if h.get("max_time") else 86400)  # capped by max_time too
+
+
+def est_time(c, name, h):
+    """A realistic Slurm -t value for such a job: the estimate, else the host's default_time."""
+    s = est_secs(c, name, h)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:00" if s is not None else h.get("default_time")
+
+
+def time_secs(t):
+    """A Slurm time limit string -> seconds (minutes, minutes:seconds, hours:minutes:seconds, days-h[:mm[:ss]])."""
+    days = 0
+    if "-" in t:
+        d, t = t.split("-", 1)
+        days = int(d) * 86400
+    p = [int(x) for x in t.split(":")]
+    if len(p) == 1:  # a bare number is minutes, but days-h means hours
+        return days + p[0] * (3600 if days else 60)
+    p = [0] * (3 - len(p)) + p
+    return days + p[0] * 3600 + p[1] * 60 + p[2]
+
+
+def slurm_argv(c, j, h, jobdir, gpus):
+    """The sbatch line launch() would run for job j on Slurm host h (kept separate so tests can build it).
+    Transparent names: -J is the gsched job's own name, sanitized; --comment carries "gsched #<id> <client>".
+    Every lookup of our Slurm jobs goes through the Slurm job id stored in the DB handle."""
+    spec, jid = json.loads(j["spec"]), j["id"]
+    g = {**gpus, "type": h.get("gres_types", {}).get(gpus["type"], gpus["type"])}  # gsched card type -> Slurm GRES
+    gres = [f"gpu:{g['type']}:{g['n']}" if g["type"] != "gpu" else f"gpu:{g['n']}"]
+    gres += [f"localdisk:{pool}:{gb}G" for pool, gb in local_disk_spec(spec, h)]  # node-local SSD/HDD scratch
+    sname = re.sub(r"[^A-Za-z0-9._-]", "", j["name"] or "")[:48] or f"gsched-{jid}"
+    t = spec.get("time") or est_time(c, j["name"], h) or h.get("default_time", "1-00:00:00")
+    mt = h.get("max_time")
+    if mt and time_secs(t) > time_secs(mt):  # nothing of ours sits on a Slurm host for longer than max_time
+        t = mt
+    args = ["sbatch", "--parsable", "-p", h["partition"], "-J", sname, "--comment", f"gsched #{jid} {client_of(j)}",
+            "-o", f"{jobdir}/slurm.out", "--gres=" + ",".join(gres),
+            "-c", str(spec.get("cpus", 4)), "-t", t]
+    if spec.get("mem_gb"):
+        args += [f"--mem={int(-(-spec['mem_gb'] // 1))}G"]
+    if spec.get("slurm_exclude"):
+        args += [f"--exclude={spec['slurm_exclude']}"]
+    return args
+
+
 def launch(c, j, h):
     spec = json.loads(j["spec"])
     jid = j["id"]
@@ -512,15 +622,7 @@ def launch(c, j, h):
              + shlex.quote("import json,sys,os\nd=sys.argv[1]\nfor k,v in json.load(sys.stdin).items(): open(os.path.join(d,k),'w').write(v)")
              + f" {q}")
     if h["backend"] == "slurm":
-        g = {**gpus, "type": h.get("gres_types", {}).get(gpus["type"], gpus["type"])}  # gsched card type -> Slurm GRES
-        args = ["sbatch", "--parsable", "-p", h["partition"], "-J", f"gsched-{jid}", "-o", f"{jobdir}/slurm.out",
-                f"--gres=gpu:{g['type']}:{g['n']}" if g["type"] != "gpu" else f"--gres=gpu:{g['n']}",
-                "-c", str(spec.get("cpus", 4)), "-t", spec.get("time") or h.get("default_time", "1-00:00:00")]
-        if spec.get("mem_gb"):
-            args += [f"--mem={int(-(-spec['mem_gb'] // 1))}G"]
-        if spec.get("slurm_exclude"):
-            args += [f"--exclude={spec['slurm_exclude']}"]
-        cmd = f"{write} && {shlex.join(args)} {q}/wrap.sh"
+        cmd = f"{write} && {shlex.join(slurm_argv(c, j, h, jobdir, gpus))} {q}/wrap.sh"
     else:
         cmd = f"{write} && cd {q} && (setsid nohup bash {q}/wrap.sh > /dev/null 2>&1 < /dev/null &) && echo started"
     rc, out, err = sh(h, cmd, stdin=payload)
@@ -766,7 +868,7 @@ def cmd_submit(a):
             "sync": not a.no_sync, "sync_paths": [homeform(p) for p in a.sync_path or []],
             "exclude": a.exclude or [], "outputs": [o.rstrip("/") for o in a.output or []], "setup_on": parse_kv(a.setup_on),
             "gpu_type": a.gpu_type, "name": a.name, "slurm_exclude": a.slurm_exclude, "client": a.client,
-            "queue_ahead": a.queue_ahead or None}
+            "queue_ahead": a.queue_ahead or None, "local_disk": a.local_disk}
     c = db()
     _, hosts = load_config()
     for s in specs:
@@ -783,11 +885,30 @@ def cmd_submit(a):
             sys.exit(f"bad environment variable name {bad[0]!r}")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", spec["client"]):
             sys.exit(f"bad client name {spec['client']!r} (letters, digits, _ . -)")
+        if spec.get("local_disk") and spec["local_disk"] != "none" and not re.fullmatch(
+                r"[A-Za-z0-9_]+:\d+(,[A-Za-z0-9_]+:\d+)*", spec["local_disk"]):
+            sys.exit(f"bad --local-disk {spec['local_disk']!r} (POOL:GiB[,POOL:GiB] or none)")
         for n in spec.get("hosts", []):
             if n not in hosts:
                 sys.exit(f"unknown host {n}; known: {', '.join(hosts)}")
             if not hosts[n]["enabled"]:
                 sys.exit(f"host {n} is disabled in {CONFIG} (enabled = false)")
+        # warn (but still accept) when the given --time is way above what past jobs with the same name stem needed,
+        # or beyond max_time on every allowed Slurm host (it would be clamped there; node hosts have no limit)
+        if spec.get("time"):
+            lim = time_secs(spec["time"])
+            slurm_hosts = [hosts[n] for n in allowed_hosts(spec, hosts) if hosts[n]["backend"] == "slurm"]
+            for hs in slurm_hosts:
+                est = est_secs(c, spec.get("name") or spec["cmd"][:40], hs)
+                if est is not None and lim > 3 * est:
+                    print(f"gsched: warning: --time {spec['time']} is over 3x the {est // 3600}h{(est % 3600) // 60:02d}m "
+                          f"estimated from past {hs['name']} jobs with the same name stem; a tighter limit queues friendlier "
+                          "for other users", file=sys.stderr)
+                    break
+            if slurm_hosts and all(hs.get("max_time") and lim > time_secs(hs["max_time"]) for hs in slurm_hosts):
+                mts = ", ".join(f"{hs['name']} {hs['max_time']}" for hs in slurm_hosts)
+                print(f"gsched: warning: --time {spec['time']} exceeds max_time on every allowed Slurm host ({mts}); "
+                      "launch will clamp it there (node hosts have no limit)", file=sys.stderr)
         cur = c.execute("insert into jobs(name, spec, state, submitted, client) values(?,?,?,?,?)",
                         (spec.get("name") or spec["cmd"][:40], json.dumps(spec), "queued", time.time(), spec["client"]))
         c.commit()
@@ -856,7 +977,10 @@ def cmd_status(a):
                 ld = f"load {r['load']:.0f}" if r.get("load") is not None else ""
                 ram = f"{r['mem_total_gb'] - r['mem_unalloc_gb']:.0f}/{r['mem_total_gb']:.0f}G"
                 print(f"  {node:<10} {r['state']:<6} CPU {r['cpu_alloc']:>2}/{r['cpu_total']:<2} {ld:<8} RAM {ram:>9}  "
-                      f"{cpu_models.get(node, ''):<18}  GPU free {gp or '-'}")
+                      f"{cpu_models.get(node, ''):<18}  GPU free {gp or '-'}"
+                      + ("  disk free " + " ".join(f"{k} {r['disk_free'][k]:.0f}/{t:.0f}G"
+                                                   for k, t in sorted(r.get("disk_total", {}).items()))
+                         if r.get("disk_total") else ""))
             continue
         print(f"{n} ({tag}): RAM avail {v['mem_avail_gb']:.0f} GiB, load {v['load1']:.1f}/{v['ncpu']}")
         for g in v["gpus"]:
@@ -1003,6 +1127,10 @@ def main():
     s.add_argument("--queue-ahead", dest="queue_ahead", action="store_true",
                    help="slurm hosts with queue_ahead = N: when no card is free, sbatch anyway (pending, any allowed type) "
                         "so the job waits in Slurm's queue; at most N such pending jobs per host")
+    s.add_argument("--local-disk", dest="local_disk",
+                   help="slurm node-local scratch, POOL:GiB[,POOL:GiB] (e.g. ssd0:50); default = the host's local_disk; "
+                        "'none' = off. Mounted at /scratch/<pool> = $GSCHED_LOCAL, TMPDIR/PYSCF_TMPDIR point there; "
+                        "deleted when the job ends, so copy results out yourself")
     s.add_argument("--slurm-exclude", dest="slurm_exclude", help="slurm nodes to avoid, e.g. gn02 (sbatch --exclude)")
     s.add_argument("-e", "--env", action="append", metavar="K=V")
     s.add_argument("--no-sync", action="store_true", help="workdir already exists on every allowed host")

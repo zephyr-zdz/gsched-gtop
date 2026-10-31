@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import shlex
+import sqlite3
 import time
 import unittest
 from unittest.mock import patch
@@ -309,3 +310,88 @@ class ReservationAndScriptTests(unittest.TestCase):
                                      ("/data/file", "/data/file")]:
                 with self.subTest(source=source):
                     self.assertEqual(core.remap(source, host()), expected)
+
+
+class LocalDiskAndTimeTests(unittest.TestCase):
+    def test_parse_localdisk(self):
+        self.assertEqual(core.parse_localdisk("localdisk:ssd0:400G"), {"ssd0": 400})
+        self.assertEqual(core.parse_localdisk("gpu:A100:2,localdisk:ssd0:50G,localdisk:hdd0:1000G"),
+                         {"ssd0": 50, "hdd0": 1000})
+        self.assertEqual(core.parse_localdisk("(null)"), {})
+
+    def test_local_disk_spec_has_no_default_pool(self):
+        slurm = host("cluster", backend="slurm")
+        self.assertEqual(core.local_disk_spec({}, slurm), [])
+        self.assertEqual(core.local_disk_spec({}, host("box")), [])
+        self.assertEqual(core.local_disk_spec({"local_disk": "ssd0:50"}, host("box")), [])
+        self.assertEqual(core.local_disk_spec({"local_disk": "ssd0:50"}, slurm), [("ssd0", 50)])
+        self.assertEqual(core.local_disk_spec({"local_disk": "ssd0:10,hdd0:20"}, slurm),
+                         [("ssd0", 10), ("hdd0", 20)])
+        self.assertEqual(core.local_disk_spec({"local_disk": "none"}, host("cluster", backend="slurm",
+                                                                          local_disk="ssd0:50")), [])
+        self.assertEqual(core.local_disk_spec({}, host("cluster", backend="slurm", local_disk="ssd0:50")),
+                         [("ssd0", 50)])
+
+    def test_slurm_view_parses_localdisk_pools(self):
+        v = core.slurm_view({"nodes": "n01 gpu:A100:2,localdisk:ssd0:400G localdisk:ssd0:100G idle 0/8/0/8 "
+                                     "32768 0 N/A N/A", "squeue": ""})
+        self.assertEqual(v["nodes"]["n01"]["disk_total"], {"ssd0": 400})
+        self.assertEqual(v["nodes"]["n01"]["disk_free"], {"ssd0": 300})
+
+    def test_place_slurm_requires_disk_room_and_records_it(self):
+        h = host("cluster", backend="slurm", gpu_types=["A100"], local_disk="ssd0:50")
+        v = slurm_view(nodes={"n01": slurm_node(disk_total={"ssd0": 400}, disk_free={"ssd0": 40})})
+        self.assertIsNone(core.place_slurm({}, h, v, []))
+        v["nodes"]["n01"]["disk_free"]["ssd0"] = 100
+        r = core.place_slurm({}, h, v, [])
+        self.assertEqual(r[1]["disk"], {"ssd0": 50})
+        taken = [{"node": "n01", "type": "A100", "n": 0, "cpus": 0, "mem_gb": 0, "disk": {"ssd0": 60}}]
+        self.assertIsNone(core.place_slurm({}, h, v, taken))
+
+    def test_time_secs_and_stem(self):
+        for text, expected in [("30", 1800), ("1:30", 90), ("2:03:04", 7384),
+                               ("1-00:00:00", 86400), ("2-03", 183600), ("0-00:30", 30)]:
+            with self.subTest(text=text):
+                self.assertEqual(core.time_secs(text), expected)
+        for name, stem in [("run", "run"), ("run-4", "run"), ("run-12", "run"), ("a_03b", "a"),
+                           ("tsal-l2-vrand0-irc-12", "tsal-l2-vrand0-irc")]:
+            with self.subTest(name=name):
+                self.assertEqual(core.stem_of(name), stem)
+
+    def test_runtime_estimate_from_same_stem(self):
+        c = sqlite3.connect(":memory:")
+        c.row_factory = sqlite3.Row
+        c.execute("create table jobs(state text, rc integer, host text, started real, ended real, name text)")
+        h = host("cluster", backend="slurm", max_time="1-00:00:00")
+        self.assertIsNone(core.est_secs(c, "run-1", h))
+        c.executemany("insert into jobs values('done',0,'cluster',?,?,?)",
+                      [(0, 1000, "run-3"), (0, 2000, "run-8"), (0, 99999, "other-1")])
+        self.assertEqual(core.est_secs(c, "run-12", h), 3600)  # 1.5 × 2000 s, rounded up to 1 h
+        self.assertEqual(core.est_time(c, "run-12", h), "1:00:00")
+        self.assertIsNone(core.est_secs(c, "run-12", host("box")))
+
+    def test_slurm_argv_name_comment_disk_and_time_clamp(self):
+        c = sqlite3.connect(":memory:")
+        c.execute("create table jobs(state text, rc integer, host text, started real, ended real, name text)")
+        h = host("cluster", backend="slurm", partition="gpu", gpu_types=["A100"], max_time="1-00:00:00",
+                 local_disk="ssd0:50", default_time="8:00:00")
+        j = {"id": 7, "name": "my job/1", "spec": json.dumps({"cpus": 2, "mem_gb": 3, "time": "2-00:00:00"}),
+             "client": "alice"}
+        args = core.slurm_argv(c, j, h, "/jobs/7", {"type": "A100", "n": 2})
+        self.assertEqual(args[args.index("-J") + 1], "myjob1")
+        self.assertEqual(args[args.index("--comment") + 1], "gsched #7 alice")
+        self.assertIn("--gres=gpu:A100:2,localdisk:ssd0:50G", args)
+        self.assertEqual(args[args.index("-t") + 1], "1-00:00:00")  # clamped by max_time
+        j["spec"] = json.dumps({"cpus": 2})
+        self.assertEqual(core.slurm_argv(c, j, h, "/jobs/7", {"type": "A100", "n": 1})[
+            core.slurm_argv(c, j, h, "/jobs/7", {"type": "A100", "n": 1}).index("-t") + 1], "8:00:00")
+
+    def test_scripts_export_local_disk_only_when_configured(self):
+        spec = {"workdir": "/work", "cmd": "true", "local_disk": "ssd0:50", "env": {"TMPDIR": "/mine"}}
+        run, _ = core.scripts(spec, host("cluster", backend="slurm"), "/jobs/1", 1, [])
+        self.assertIn("export GSCHED_LOCAL_SSD0=/scratch/ssd0", run)
+        self.assertIn("export GSCHED_LOCAL=/scratch/ssd0", run)
+        self.assertIn("export PYSCF_TMPDIR=/scratch/ssd0/tmp", run)
+        self.assertNotIn("export TMPDIR=/scratch/ssd0/tmp", run)  # the job set it itself
+        run, _ = core.scripts({"workdir": "/work", "cmd": "true"}, host("box"), "/jobs/1", 1, [])
+        self.assertNotIn("GSCHED_LOCAL", run)
