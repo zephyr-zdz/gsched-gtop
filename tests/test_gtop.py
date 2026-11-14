@@ -20,17 +20,17 @@ class FormattingTests(unittest.TestCase):
 
     def test_bar_clamping_and_fractional_cell(self):
         for frac, width, expected in [
-            (-1, 4, "····"), (0, 4, "····"), (0.5, 4, "██··"),
-            (0.375, 4, "█▌··"), (1, 4, "████"), (2, 4, "████"), (0.5, 0, ""),
+            (-1, 4, "...."), (0, 4, "...."), (0.5, 4, "##.."),
+            (0.375, 4, "#▌.."), (1, 4, "####"), (2, 4, "####"), (0.5, 0, ""),
         ]:
             with self.subTest(frac=frac, width=width):
                 self.assertEqual(gtop.bar(frac, width), expected)
 
     def test_spark_padding_recent_samples_and_saturation(self):
-        self.assertEqual(gtop.spark([], 4), ("····", ""))
-        self.assertEqual(gtop.spark([0, 50, 100], 5), ("··", " ▅█"))
-        self.assertEqual(gtop.spark([1, 0, 25, 200], 3), ("", " ▃█"))
-        self.assertEqual(gtop.spark(iter([12.5, 87.5]), 2), ("", "▂█"))
+        self.assertEqual(gtop.spark([], 4), ("....", ""))
+        self.assertEqual(gtop.spark([0, 50, 100], 5), ("..", " +#"))
+        self.assertEqual(gtop.spark([1, 0, 25, 200], 3), ("", " -#"))
+        self.assertEqual(gtop.spark(iter([12.5, 87.5]), 2), ("", ":#"))
 
     def test_hms_boundaries(self):
         for seconds, expected in [(0, "0m00s"), (59.9, "0m59s"), (60, "1m00s"),
@@ -76,7 +76,7 @@ class CpuPageTests(unittest.TestCase):
                                                       {"node1": {"cores": 8, "threads": 16}}), 120))
         self.assertIn("node1", text)
         self.assertIn("ours  2/8 cpus", text)
-        self.assertIn("load █", text)
+        self.assertIn("load #", text)
         self.assertIn("RAM avail    32G", text)
         self.assertIn("8C16T", text)
         self.assertIn("csched queue", text)

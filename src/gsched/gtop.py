@@ -450,8 +450,11 @@ def daemon_state():
 
 # ---------------------------------------------------------------- formatting
 
-SPARK = "▁▂▃▄▅▆▇█"
-EIGHTHS = " ▏▎▍▌▋▊▉"
+# ASCII only where cells REPEAT: byte-oriented curses (Apple's non-wide libncurses, or any
+# build under the C locale) optimizes runs of identical cells into <byte> + CSI Ps b repeats,
+# which turns multibyte glyphs into invalid UTF-8 (Ghostty shows U+2588 runs as U+FFFD).
+SPARK = ".:-=+*%#"
+EIGHTHS = " ▏▎▍▌▋▊▉"   # single trailing cell, never repeated: multibyte is fine here
 
 
 def bar(frac, w):
@@ -459,14 +462,14 @@ def bar(frac, w):
     n = frac * w
     full = int(n)
     part = int((n - full) * 8) if full < w else 0
-    s = "█" * full + (EIGHTHS[part] if part else "")
-    return s + "·" * (w - len(s))
+    s = "#" * full + (EIGHTHS[part] if part else "")
+    return s + "." * (w - len(s))
 
 
 def spark(vals, w):
     """(placeholder for samples not taken yet, sparkline of the last w samples)."""
     vals = list(vals)[-w:] if w > 0 else []
-    return "·" * (w - len(vals)), "".join(SPARK[min(7, int(v / 100 * 8))] if v > 0 else " " for v in vals)
+    return "." * (w - len(vals)), "".join(SPARK[min(7, int(v / 100 * 8))] if v > 0 else " " for v in vals)
 
 
 def gib(mib):
@@ -865,7 +868,7 @@ HELP = """gtop keys
 GPU line: util bar, memory bar, temperature, power draw/limit, and gsched's
 view of the card: idle / settling (idle for less than idle_seconds) / gsched #job / mine (not gsched) /
 foreign <user> / reserved <holder> / busy. 'hist' = util history, one cell per probe, newest on the right
-(· = not sampled yet). Process rows: pid, user, SM %, GPU memory, elapsed, CPU %, RSS, gsched job, command.
+(. = not sampled yet). Process rows: pid, user, SM %, GPU memory, elapsed, CPU %, RSS, gsched job, command.
 Other users' processes show only their process name. Hosts and thresholds come from gsched's hosts.toml.
 
 Slurm hosts: only the cards your running GPU jobs hold, probed from inside each job by one
